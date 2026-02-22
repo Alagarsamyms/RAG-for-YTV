@@ -26,7 +26,8 @@ import tiktoken
 from dataclasses import dataclass, asdict
 
 ENCODING_NAME = "cl100k_base"  # matches text-embedding-3-small & GPT-4o
-OVERLAP_SENTENCES = 2          # sentences carried over to next chunk
+OVERLAP_SENTENCES = 2          # sentences seeded into start of next chunk
+DEFAULT_CHUNK_SIZE = 400       # safe default — keeps chunks well under 512 tokens
 
 
 @dataclass
@@ -82,7 +83,7 @@ def chunk_transcript(
 
     Returns a list of Chunk objects, each containing full sentences only.
     """
-    max_tokens = chunk_size or int(os.getenv("CHUNK_SIZE_TOKENS", "500"))
+    max_tokens = chunk_size or int(os.getenv("CHUNK_SIZE_TOKENS", str(DEFAULT_CHUNK_SIZE)))
     enc = _get_encoder()
 
     # ── Build a flat list of (sentence, approx_start_time_sec) ──────────────
@@ -97,29 +98,43 @@ def chunk_transcript(
         return []
 
     # ── Greedily accumulate sentences into chunks ────────────────────────────
+    # Sentence-boundary guarantee:
+    #   - A chunk is ONLY closed after a complete sentence. The inner loop
+    #     breaks BEFORE appending the offending sentence, not after, so the
+    #     last sentence in every chunk is always complete.
+    #   - The NEXT chunk is seeded with the last `overlap_sentences` complete
+    #     sentences from the chunk just closed, so it also starts on a full
+    #     sentence boundary.
+    #   → Every chunk starts AND ends at a full sentence boundary.
     chunks: list[Chunk] = []
     chunk_index = 0
+    seed_sents: list[str] = []   # overlap sentences carried forward
+
     i = 0  # pointer into sentence_pairs
 
     while i < len(sentence_pairs):
-        current_sents: list[str] = []
+        # Seed this chunk with overlap sentences from the previous chunk
+        current_sents: list[str] = list(seed_sents)
         current_start_time: float = sentence_pairs[i][1]
 
+        # Accumulate whole sentences until the NEXT sentence would exceed limit
         while i < len(sentence_pairs):
             sent, _ = sentence_pairs[i]
             candidate = " ".join(current_sents + [sent])
             if len(enc.encode(candidate)) > max_tokens and current_sents:
-                # Adding this sentence would exceed limit — close the chunk
+                # Next sentence would exceed max_tokens — close chunk HERE.
+                # The current last sentence is already complete.
                 break
             current_sents.append(sent)
             i += 1
 
         if not current_sents:
-            # Single sentence is already longer than chunk_size — take it alone
+            # Edge case: single sentence longer than max_tokens.
+            # Accept it alone to avoid infinite loop.
             current_sents.append(sentence_pairs[i][0])
             i += 1
 
-        chunk_text = " ".join(current_sents)
+        chunk_text  = " ".join(current_sents)
         token_count = len(enc.encode(chunk_text))
 
         chunks.append(
@@ -135,10 +150,11 @@ def chunk_transcript(
         )
         chunk_index += 1
 
-        # Overlap: step back `overlap_sentences` sentences so the next chunk
-        # starts with context from the end of this one
-        if overlap_sentences > 0 and i < len(sentence_pairs):
-            i = max(i - overlap_sentences, i - len(current_sents) + 1)
+        # Build overlap seed for next chunk:
+        # Take the last `overlap_sentences` of the NEW sentences added this
+        # round (excluding sentences that were already seed from last chunk).
+        new_sents = current_sents[len(seed_sents):]
+        seed_sents = new_sents[-overlap_sentences:] if overlap_sentences > 0 else []
 
     return chunks
 
