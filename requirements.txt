@@ -1,0 +1,20 @@
+# YouTube RAG Pipeline - Dependencies
+
+# Core
+streamlit>=1.31.0
+python-dotenv>=1.0.0
+
+# YouTube Transcript
+youtube-transcript-api>=1.0.0
+
+# Text Processing & Tokenization
+tiktoken>=0.7.0
+
+# Embeddings & LLM
+openai>=1.12.0
+
+# Vector Database (Supabase + pgvector)
+supabase>=2.3.0
+
+# Utilities
+tenacity>=8.2.0
