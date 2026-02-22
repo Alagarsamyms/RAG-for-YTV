@@ -4,6 +4,13 @@ app.py — Streamlit UI for the YouTube RAG Pipeline
 Step 1: User pastes a YouTube URL → transcript is fetched, chunked,
         embedded, and stored in Supabase (skipped if already indexed).
 Step 2: User types a question → similarity search + LLM answer is shown.
+
+Secrets strategy
+────────────────
+- Local dev: reads from .env via python-dotenv
+- Streamlit Cloud: reads from st.secrets (set in the Streamlit dashboard)
+  _load_secrets() bridges st.secrets → os.environ so that all src/ modules
+  that use os.getenv() work without modification.
 """
 
 import os
@@ -11,7 +18,20 @@ import logging
 import streamlit as st
 from dotenv import load_dotenv
 
-load_dotenv()
+# ── Load secrets (local .env first, then Streamlit Cloud secrets) ────────────
+load_dotenv()  # no-op on Streamlit Cloud if no .env present
+
+def _load_streamlit_secrets() -> None:
+    """Copy st.secrets into os.environ so src/ modules can use os.getenv()."""
+    try:
+        for key, value in st.secrets.items():
+            if isinstance(value, str) and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        pass  # st.secrets not available locally without a secrets.toml
+
+_load_streamlit_secrets()
+# ─────────────────────────────────────────────────────────────────────────────
 
 from src.transcript import get_video_id, fetch_transcript, get_video_metadata
 from src.chunker import chunk_transcript, chunks_to_dicts, count_tokens
