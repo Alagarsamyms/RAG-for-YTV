@@ -1,15 +1,32 @@
 """
 src/chunker.py
 ──────────────
-Split transcript text into token-bounded chunks with metadata.
-Uses tiktoken (cl100k_base) for exact token counting.
+Sentence-aware, token-bounded chunking of YouTube transcripts.
+
+Strategy:
+  1. Collect all transcript segment text into one string.
+  2. Split into sentences using a simple regex (no extra dependencies).
+  3. Greedily accumulate whole sentences into a chunk until adding the
+     next sentence would exceed `chunk_size` tokens — then close the
+     chunk and start a new one.
+  4. Overlap: seed each new chunk with the last `overlap_sentences`
+     sentences from the previous chunk, so context at boundaries is
+     preserved.
+  5. Track exact token count per chunk using tiktoken (cl100k_base).
+
+Why sentence-aware?
+  Pure token-slicing can cut "...attention mecha|nisms..." mid-word.
+  Sentence-aware chunking ensures every chunk starts and ends at a
+  natural sentence boundary → better retrieval quality.
 """
 
 import os
+import re
 import tiktoken
 from dataclasses import dataclass, asdict
 
 ENCODING_NAME = "cl100k_base"  # matches text-embedding-3-small & GPT-4o
+OVERLAP_SENTENCES = 2          # sentences carried over to next chunk
 
 
 @dataclass
@@ -20,7 +37,7 @@ class Chunk:
     chunk_index: int
     chunk_text: str
     token_count: int
-    start_time_sec: float  # approximate, from closest transcript segment
+    start_time_sec: float   # approximate timestamp of the first sentence in chunk
 
 
 def _get_encoder() -> tiktoken.Encoding:
@@ -28,9 +45,19 @@ def _get_encoder() -> tiktoken.Encoding:
 
 
 def count_tokens(text: str) -> int:
-    """Return the number of tokens in *text* using cl100k_base."""
-    enc = _get_encoder()
-    return len(enc.encode(text))
+    """Return the exact token count for *text* using cl100k_base."""
+    return len(_get_encoder().encode(text))
+
+
+def _split_sentences(text: str) -> list[str]:
+    """
+    Split text into sentences using punctuation boundaries.
+    Handles common abbreviations well enough for transcript text.
+    Returns a list of non-empty sentence strings.
+    """
+    # Split on . ! ? followed by whitespace or end-of-string
+    raw = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [s.strip() for s in raw if s.strip()]
 
 
 def chunk_transcript(
@@ -39,82 +66,83 @@ def chunk_transcript(
     video_title: str,
     video_url: str,
     chunk_size: int | None = None,
-    overlap: int | None = None,
-) -> list[Chunk]:
+    overlap: int | None = None,         # kept for API compat; overlap is sentence-based
+    overlap_sentences: int = OVERLAP_SENTENCES,
+) -> list["Chunk"]:
     """
-    Split transcript segments into overlapping token-bounded chunks.
+    Split transcript segments into sentence-aware, token-bounded chunks.
 
-    Each segment is a dict: {"text": str, "start": float, "duration": float}
+    Each segment: {"text": str, "start": float, "duration": float}
 
-    Strategy:
-      - Accumulate full text word-by-word from segments.
-      - When a chunk reaches chunk_size tokens, store it and start the next
-        chunk with the last *overlap* tokens of the previous one.
-      - Record the start_time_sec of the first segment that contributed to
-        each chunk.
+    Parameters
+    ----------
+    chunk_size        : max tokens per chunk (default: CHUNK_SIZE_TOKENS env var or 500)
+    overlap_sentences : how many sentences from the end of the previous chunk
+                        to carry into the start of the next chunk (default: 2)
 
-    Returns a list of Chunk objects.
+    Returns a list of Chunk objects, each containing full sentences only.
     """
-    chunk_size = chunk_size or int(os.getenv("CHUNK_SIZE_TOKENS", "500"))
-    overlap = overlap or int(os.getenv("CHUNK_OVERLAP_TOKENS", "50"))
-
+    max_tokens = chunk_size or int(os.getenv("CHUNK_SIZE_TOKENS", "500"))
     enc = _get_encoder()
 
-    chunks: list[Chunk] = []
-    current_tokens: list[int] = []   # token IDs of the current chunk
-    current_start_time: float = 0.0
-    chunk_index = 0
-
-    for seg_idx, seg in enumerate(segments):
+    # ── Build a flat list of (sentence, approx_start_time_sec) ──────────────
+    sentence_pairs: list[tuple[str, float]] = []
+    for seg in segments:
         seg_text = seg["text"].strip().replace("\n", " ")
-        seg_tokens = enc.encode(seg_text + " ")
+        seg_start = seg.get("start", 0.0)
+        for sent in _split_sentences(seg_text):
+            sentence_pairs.append((sent, seg_start))
 
-        # If this is the very first segment contributing to this chunk,
-        # record its start time.
-        if not current_tokens:
-            current_start_time = seg.get("start", 0.0)
+    if not sentence_pairs:
+        return []
 
-        current_tokens.extend(seg_tokens)
+    # ── Greedily accumulate sentences into chunks ────────────────────────────
+    chunks: list[Chunk] = []
+    chunk_index = 0
+    i = 0  # pointer into sentence_pairs
 
-        # When we exceed chunk_size, flush the chunk
-        while len(current_tokens) >= chunk_size:
-            chunk_text = enc.decode(current_tokens[:chunk_size])
-            chunks.append(
-                Chunk(
-                    video_id=video_id,
-                    video_title=video_title,
-                    video_url=video_url,
-                    chunk_index=chunk_index,
-                    chunk_text=chunk_text,
-                    token_count=chunk_size,
-                    start_time_sec=current_start_time,
-                )
-            )
-            chunk_index += 1
+    while i < len(sentence_pairs):
+        current_sents: list[str] = []
+        current_start_time: float = sentence_pairs[i][1]
 
-            # Keep the overlap tokens and reset start time
-            current_tokens = current_tokens[chunk_size - overlap:]
-            # Approximate: next chunk starts at current segment start
-            current_start_time = seg.get("start", 0.0)
+        while i < len(sentence_pairs):
+            sent, _ = sentence_pairs[i]
+            candidate = " ".join(current_sents + [sent])
+            if len(enc.encode(candidate)) > max_tokens and current_sents:
+                # Adding this sentence would exceed limit — close the chunk
+                break
+            current_sents.append(sent)
+            i += 1
 
-    # Flush any remaining tokens as the final (possibly shorter) chunk
-    if current_tokens:
-        remaining_text = enc.decode(current_tokens)
+        if not current_sents:
+            # Single sentence is already longer than chunk_size — take it alone
+            current_sents.append(sentence_pairs[i][0])
+            i += 1
+
+        chunk_text = " ".join(current_sents)
+        token_count = len(enc.encode(chunk_text))
+
         chunks.append(
             Chunk(
                 video_id=video_id,
                 video_title=video_title,
                 video_url=video_url,
                 chunk_index=chunk_index,
-                chunk_text=remaining_text,
-                token_count=len(current_tokens),
+                chunk_text=chunk_text,
+                token_count=token_count,
                 start_time_sec=current_start_time,
             )
         )
+        chunk_index += 1
+
+        # Overlap: step back `overlap_sentences` sentences so the next chunk
+        # starts with context from the end of this one
+        if overlap_sentences > 0 and i < len(sentence_pairs):
+            i = max(i - overlap_sentences, i - len(current_sents) + 1)
 
     return chunks
 
 
 def chunks_to_dicts(chunks: list[Chunk]) -> list[dict]:
-    """Convert list of Chunk dataclasses to plain dicts for serialization."""
+    """Convert list of Chunk dataclasses to plain dicts."""
     return [asdict(c) for c in chunks]
