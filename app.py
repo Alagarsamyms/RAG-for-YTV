@@ -157,6 +157,11 @@ def check_env() -> list[str]:
     return missing
 
 
+def _is_cloud() -> bool:
+    """Heuristic: Streamlit Cloud sets HOSTNAME or lacks a local .env."""
+    return os.getenv("STREAMLIT_SHARING_MODE") is not None or not os.path.exists(".env")
+
+
 # ─── Session State ──────────────────────────────────────────────────────────
 if "video_id" not in st.session_state:
     st.session_state.video_id = None
@@ -186,8 +191,19 @@ with st.sidebar:
 
     missing_vars = check_env()
     if missing_vars:
-        st.error(f"⚠️ Missing environment variables:\n`{'`, `'.join(missing_vars)}`")
-        st.markdown("Create a `.env` file based on `.env.example`.")
+        st.error(f"⚠️ Missing secrets: `{'`, `'.join(missing_vars)}`")
+        if _is_cloud():
+            st.markdown(
+                "**Streamlit Cloud:** Go to your app → "
+                "**Settings → Secrets** and add:\n"
+                "```toml\n"
+                "OPENAI_API_KEY = \"sk-...\"\n"
+                "SUPABASE_URL   = \"https://....supabase.co\"\n"
+                "SUPABASE_KEY   = \"your-key\"\n"
+                "```"
+            )
+        else:
+            st.markdown("Copy `.env.example` → `.env` and fill in your keys.")
     else:
         st.success("✅ Environment configured")
 
@@ -253,7 +269,7 @@ if process_btn:
     if not youtube_url.strip():
         st.warning("Please enter a YouTube URL.")
     elif check_env():
-        st.error("Configure your `.env` file before processing.")
+        st.error("⚠️ API keys not configured — check the sidebar for instructions.")
     else:
         try:
             with st.spinner("Extracting video ID…"):
