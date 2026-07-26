@@ -33,13 +33,16 @@ def _load_streamlit_secrets() -> None:
 _load_streamlit_secrets()
 # ─────────────────────────────────────────────────────────────────────────────
 
-from src.transcript import get_video_id, fetch_transcript, get_video_metadata
+from src.transcript import get_video_id, fetch_transcript, get_video_metadata, build_proxy_config
 from src.chunker import chunk_transcript, chunks_to_dicts, count_tokens
 from src.embedder import embed_texts
 from src.vector_store import upsert_chunks, similarity_search, video_is_indexed, delete_video
 from src.qa_engine import answer_query
 
 logging.basicConfig(level=logging.INFO)
+
+# Build proxy config once at startup (None on local dev, proxy object on cloud)
+_PROXY_CONFIG = build_proxy_config()
 
 # ─── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -287,7 +290,7 @@ if process_btn:
             else:
                 # Fetch transcript
                 with st.spinner("Fetching transcript…"):
-                    segments = fetch_transcript(vid_id)
+                    segments = fetch_transcript(vid_id, proxy_config=_PROXY_CONFIG)
 
                 st.success(f"✅ Transcript fetched — {len(segments)} segments.")
 
@@ -335,11 +338,38 @@ if process_btn:
                 st.session_state.total_tokens = total_tokens
 
         except Exception as exc:
-            st.error(f"❌ {exc}")
-            st.markdown(
-                "💡 **Tip**: If the transcript is unavailable, try a different video or "
-                "check that captions are enabled on the video."
-            )
+            err_str = str(exc)
+            # Detect YouTube IP-block (cloud datacenter IP)
+            if any(k in err_str for k in ["IpBlocked", "RequestBlocked", "blocked", "cloud provider"]):
+                st.error("❌ YouTube is blocking requests from this cloud server's IP address.")
+                st.markdown(
+                    """
+                    **This is a known issue when running on Streamlit Cloud / AWS / GCP / Azure.**
+                    YouTube blocks datacenter IPs. To fix this permanently, route requests
+                    through a **residential proxy** by adding these secrets:
+
+                    **Option A — Webshare (recommended)**
+                    1. Sign up at [webshare.io](https://webshare.io) and get a **Residential** plan.
+                    2. Add to your Streamlit Cloud secrets (Settings → Secrets):
+                    ```toml
+                    WEBSHARE_PROXY_USERNAME = "your-webshare-username"
+                    WEBSHARE_PROXY_PASSWORD = "your-webshare-password"
+                    ```
+
+                    **Option B — Any HTTP/HTTPS proxy**
+                    ```toml
+                    HTTP_PROXY  = "http://user:pass@your-proxy-host:port"
+                    HTTPS_PROXY = "http://user:pass@your-proxy-host:port"
+                    ```
+                    After saving secrets, reboot the app (☰ → Rerun).
+                    """
+                )
+            else:
+                st.error(f"❌ {exc}")
+                st.markdown(
+                    "💡 **Tip**: If the transcript is unavailable, try a different video or "
+                    "check that captions are enabled on the video."
+                )
 
 # Show current video badge
 if st.session_state.video_id:

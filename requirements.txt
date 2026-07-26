@@ -6,6 +6,9 @@ python-dotenv>=1.0.0
 
 # YouTube Transcript
 youtube-transcript-api>=1.0.0
+# yt-dlp: cloud fallback — uses android/web innertube client which bypasses
+# YouTube's datacenter IP blocks without any proxy or account signup.
+yt-dlp>=2024.1.0
 
 # Text Processing & Tokenization
 tiktoken>=0.7.0
